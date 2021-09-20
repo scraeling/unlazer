@@ -22,13 +22,11 @@ import { DB } from "https://deno.land/x/sqlite@v3.1.1/mod.ts";
 import { connect } from "https://deno.land/x/sqlite_shell@1.1.0/mod.ts";
 import ProgressBar from "https://deno.land/x/progress@v1.2.3/mod.ts";
 
-const appdata = Deno.env.get("APPDATA") as string;
-const localappdata = Deno.env.get("LOCALAPPDATA") as string;
-
+const logfile = path.join(Deno.env.get("TEMP") as string, "unlazer.log");
 await log.setup({
     handlers: {
         file: new log.handlers.FileHandler("DEBUG", {
-            filename: path.join(appdata, "osu", "unlazer.log"),
+            filename: logfile,
             formatter: "[{datetime}] {msg}",
         }),
         console: new log.handlers.ConsoleHandler("INFO", {
@@ -43,133 +41,71 @@ await log.setup({
     },
 });
 const logger = log.getLogger();
-
-function rowCount(db: DB, tableName: string): number {
-    logger.debug(`Getting row count for ${tableName}`);
-    const count = db.query(`SELECT COUNT(*) FROM ${tableName}`);
-    if (!count) {
-        logger.error(`Could not find database table: ${tableName}`);
-    }
-    return count[0][0] as number;
-}
-
-/**
- * 	hash: `9d1ab9ad1c...`
- * 	path:`/9/9d/{hash}` */
-function hashToFilePath(hash: string): string {
-    return path.join(hash[0], hash.substring(0, 2), hash);
-}
-
-function getFilePaths(db: DB, lazerFiles: string, stableFiles: string) {
-    /*
-   ┌───────────────────┐
-   │BeatmapSetFileInfo │                        ┌────────────────┐
-   │|-ID               │                        │BeatmapMetadata │
-   │|-BeatmapSetInfoID─┼─┐                 ┌────┤|-ID            │
- ┌─┤|-FileInfoID       │ │   ┌───────────┐ │    │|-Artist        │
- │ │|-Filename         │ │   │FileInfo   │ │    │|-Author        │
- │ └───────────────────┘ │ ┌─┤|-ID       │ │    │|-Title         │
- │                       │ │ │|-Hash     │ │    └────────────────┘
- └───────────────────-──>┼>┘ └───────────┘ │
-                         │                 └────────────────────┐
-                         │             ┌─────────────────────┐  │
-   ┌───────────────────┐ │             │BeatmapSetInfo       │  │
-   │ BeatmapInfo       │ │             │|-MetadataID ────────┼──┘
-   │ |-ID              │ ├>────────────┤|-ID                 │
-   │ |-BeatmapSetInfoID├─┘             │|-OnlineBeatmapSetID │
-   └───────────────────┘               └─────────────────────┘
-    */
-
-    const nc = (x: any) => x == null ? "" : x; // null check
-
-    // Get the data we need to generate a folder name for each BeatmapSet
-    const folderQuery = db.query(`
-        SELECT BeatmapSetInfo.ID, OnlineBeatmapSetID, Artist, Author, Title
-        FROM BeatmapSetInfo
-        INNER JOIN BeatmapMetadata ON BeatmapMetadata.ID = BeatmapSetInfo.MetadataID
-        GROUP BY BeatmapSetInfo.ID
-    `);
-    let folderNames: { [id: number]: string } = {};
-    for (const [ID, onlineID, artist, author, title] of folderQuery) {
-        folderNames[ID as number] = path.normalize(`${nc(onlineID)} ${nc(artist)} - ${
-            nc(title)
-        } [${nc(author)}]`.trim());
-    }
-
-    // Get filenames and hashes, and generate final paths
-    const fileQuery = db.query(`
-        SELECT BeatmapSetInfoID, Filename, Hash
-        FROM BeatmapSetFileInfo
-        INNER JOIN FileInfo ON FileInfo.ID = BeatmapSetFileInfo.FileInfoID
-    `);
-    let paths = new Array<[string, string]>();
-    for (const [ID, filename, hash] of fileQuery) {
-        const src: string = path.join(
-            lazerFiles,
-            hashToFilePath(hash as string),
-        );
-        const dest: string = path.join(
-            stableFiles,
-            folderNames[ID as number],
-            filename as string,
-        );
-        paths.push([src, dest]);
-    }
-    return paths;
-}
+logger.debug("Starting");
 
 function copyFile(src: string, dest: string) {
     try {
         fs.ensureDirSync(path.dirname(dest));
         fs.copySync(src, dest);
     } catch (error) {
-        logger.debug(error);
+        // Jank error checking because fs doesn't have error types
+        if (!(error as Error).message.endsWith("exists.")) {
+            logger.debug(`Failed to copy\n${src}\n=> ${dest}`);
+            logger.debug(error);
+            return false;
+        }
     }
+    return true;
 }
 
-async function linkFile(src: string, dest: string) {
+function linkFile(src: string, dest: string) {
     try {
-        await fs.ensureSymlink(src, dest);
+        fs.ensureSymlinkSync(src, dest);
     } catch (error) {
+        logger.debug(`Failed to link\n${src}\n=> ${dest}`);
         logger.debug(error);
+        return false;
     }
-}
-
-// FIXME: Workaround until https://github.com/dyedgreen/deno-sqlite/issues/149 is resolved
-async function setJournalMode(dbPath: string, mode: string) {
-    const db = await connect(dbPath);
-    logger.debug(`Setting journal_mode to ${mode}`);
-    await db.execute(`PRAGMA journal_mode = '${mode}'`);
-    await db.close();
+    return true;
 }
 
 async function main() {
-    logger.debug("Starting");
     console.clear();
-    console.log("========== unlazer ==========\n\n");
+    console.log("========== unlazer ==========");
 
     // Get lazer dir
     console.log(
-        "Let's locate your osu directories. Press enter to use the defaults.\n\n",
+        "Let's locate your osu directories. Press enter to use the defaults.",
     );
     const lazerDir = prompt(
         "Enter the path to the osu!lazer data directory:\n",
-        path.join(appdata, "osu"),
+        path.join(Deno.env.get("APPDATA") as string, "osu"),
     ) as string;
     logger.debug(`Setting lazer directory to: ${lazerDir}`);
     const lazerFiles = path.join(lazerDir, "files");
     const dbPath = path.join(lazerDir, "client.db");
 
-    await setJournalMode(dbPath, "OFF");
+    // FIXME: Workaround until sqlite can handle file locks (https://github.com/dyedgreen/deno-sqlite/issues/149)
+    const setJournalMode = async (mode: string) => {
+        const db = await connect(dbPath);
+        logger.debug(`Setting journal_mode to ${mode}`);
+        await db.execute(`PRAGMA journal_mode = '${mode}'`);
+        await db.close();
+    };
+    await setJournalMode("OFF");
 
     // Open and check database
-    logger.debug(`Attempting to connect to: ${dbPath}`);
+    logger.debug(`Opening database: ${dbPath}`);
     const db = new DB(dbPath);
-    logger.info(`Using ${dbPath}`);
+    const getRowCount = (tableName: string) => {
+        logger.debug(`Getting row count for ${tableName}`);
+        const count = db.query(`SELECT COUNT(*) FROM ${tableName}`);
+        return count[0][0] as number;
+    };
     const count = {
-        maps: rowCount(db, "BeatmapInfo"),
-        sets: rowCount(db, "BeatmapSetInfo"),
-        files: rowCount(db, "BeatmapSetFileInfo"),
+        maps: getRowCount("BeatmapInfo"),
+        sets: getRowCount("BeatmapSetInfo"),
+        files: getRowCount("BeatmapSetFileInfo"),
     };
     logger.info(
         `This osu!lazer install has ${count.sets} mapsets with ${count.maps} beatmaps and ${count.files} files.`,
@@ -177,21 +113,22 @@ async function main() {
 
     // Get stable dir
     const stableDir = prompt(
-        "\n\nEnter the path to the osu!(stable) directory:\n",
-        path.join(localappdata, "osu!"),
+        "Enter the path to the osu!(stable) directory:",
+        path.join(Deno.env.get("LOCALAPPDATA") as string, "osu!"),
     ) as string;
-    logger.debug(`Setting stable directory to: ${stableDir}`);
+    logger.debug(`Setting osu! directory to: ${stableDir}`);
     const stableFiles = path.join(stableDir, "Songs");
     fs.ensureDirSync(stableFiles);
 
     // Set operating mode
-    console.log("\n\nRun in copy or symlink mode?\n");
+    console.log("Run in copy or symlink mode?");
     console.log(
-        "copy: Makes a copy of all files, uses more space, takes longer, but stable.\n",
+        "    copy: Makes a copy of all files, uses more space, takes longer, but good as old.",
     );
     console.log(
-        "symlink: Links files to the osu!lazer library, faster, no duplication, but editing files may break stuff.\n",
+        "    symlink: Links files to the osu!lazer library, but editing files may break stuff.",
     );
+
     let op = copyFile;
     let mode = prompt("", "copy");
     if (mode != "copy") {
@@ -202,44 +139,90 @@ async function main() {
 
     // Confirmation
     console.log(
-        `\n\n${mode}ing ${count.files} files from ${lazerFiles} to ${stableFiles}\n`,
+        `${mode.toUpperCase()}ING ${count.files} files\n\tfrom ${lazerFiles}\n\tto ${stableFiles}`,
     );
     if (prompt("Continue?", "Yes")?.toLowerCase() != "yes") {
-        logger.critical("Exiting");
+        logger.critical("User cancelled operation");
         db.close();
+        setJournalMode("WAL");
         Deno.exit(1223);
     }
 
-    // Set up progressbar
-    const displayFormat = `${mode.toUpperCase()}ING (:completed/:total) [:bar] :percent`;
-    const progress = new ProgressBar({
+    // Initialize progress bar
+    const displayFormat =
+        `\t${mode.toUpperCase()}ING (:completed/:total) [:bar] :percent`;
+    const progressBar = new ProgressBar({
         total: count.files,
         complete: "=",
         incomplete: "-",
         display: displayFormat,
     });
-    let completed = 0;
-    console.log("\n\n\n");
-    progress.render(completed);
+    progressBar.render(0);
 
-    // Perform operations
-    const paths = getFilePaths(db, lazerFiles, stableFiles);
-    for (const [src, dest] of paths) {
-        logger.debug(`${mode}ing ${src} to ${dest}`);
-        await op(src, dest);
-        completed += 1;
-        if (completed % 128 == 0) {
-            progress.render(completed);
-        }
+    // Get the data we need to generate a folder name for each BeatmapSet
+    const folderQuery = db.query(`
+        SELECT BeatmapSetInfo.ID, OnlineBeatmapSetID, Artist, Author, Title
+        FROM BeatmapSetInfo
+        INNER JOIN BeatmapMetadata ON BeatmapMetadata.ID = BeatmapSetInfo.MetadataID
+        GROUP BY BeatmapSetInfo.ID
+    `);
+
+    let folderNames: { [id: number]: string } = {};
+    const nc = (x: any) => x == null ? "" : x;
+    for (const [ID, onlineID, artist, author, title] of folderQuery) {
+        folderNames[ID as number] = `${nc(onlineID)} ${nc(artist)} - ${
+            nc(title)
+        } [${nc(author)}]`
+            .trim()
+            .replace(/[<>:"/\\|?*]/g, "-");
     }
 
-    // Exit
-    console.log("\n\n\n");
-    logger.info(`Completed ${mode} operations successfully.`);
-    console.log("\nStart osu! and hit F5 to scan for the beatmaps.\n\n");
-    logger.debug("Closing database and exiting");
+    // Get filenames and hashes, generate final paths, and perform op
+    const fileQuery = db.query(`
+        SELECT BeatmapSetInfoID, Filename, Hash
+        FROM BeatmapSetFileInfo
+        INNER JOIN FileInfo ON FileInfo.ID = BeatmapSetFileInfo.FileInfoID
+    `);
+
+    const hashToFile = (hash: string) =>
+        path.join(hash[0], hash.substring(0, 2), hash);
+    let progress = { completed: 0, errors: 0 };
+    for (const [ID, filename, hash] of fileQuery) {
+        const src: string = path.join(
+            lazerFiles,
+            hashToFile(hash as string),
+        );
+        const dest: string = path.join(
+            stableFiles,
+            folderNames[ID as number],
+            (filename as string),
+        );
+
+        //logger.debug(`${mode}ing\n${src}\n =>${dest}`);
+        const success = op(src, dest);
+        if (!success) {
+            progress.errors += 1;
+        }
+        progress.completed += 1;
+        if (progress.completed % 128 == 0) {
+            progressBar.render(progress.completed);
+        }
+    }
+    progressBar.render(progress.completed);
+
+    // Finish
+    if (progress.errors != 0) {
+        logger.info(`Completed ${mode} operations.`);
+        logger.warning(`There were ${progress.errors} errors.`);
+        console.log(`Check ${logfile} for details.`);
+    } else {
+        logger.info(`Completed all ${mode} operations successfully.`);
+    }
+    console.log("Start osu! and hit F5 to scan for beatmaps.");
+
     db.close();
-    await setJournalMode(dbPath, "WAL");
+    await setJournalMode("WAL");
+    logger.debug("Done");
 }
 
 await main();
