@@ -43,47 +43,27 @@ await log.setup({
 const logger = log.getLogger();
 logger.debug("Starting");
 
-async function copyFile(src: string, dest: string) {
+function copyFile(src: string, dest: string) {
     try {
         fs.ensureDirSync(path.dirname(dest));
         fs.copySync(src, dest);
     } catch (error) {
-        //FIXME: Jank error checking because fs doesn't have error types
         if (!(error as Error).message.endsWith("exists.")) {
-            //FIXME: Jank safety net
-            let p = Deno.run({
-                cmd: ["cmd", "/C", "copy", "/Y", src, dest],
-                stderr: "null",
-                stdin: "null",
-                stdout: "null",
-            });
-            if (!(await p.status()).success) {
                 logger.debug(`Failed to copy\n${src}\n=> ${dest}`);
                 logger.debug(error);
                 return false;
-            }
         }
     }
     return true;
 }
 
-async function linkFile(src: string, dest: string) {
+function linkFile(src: string, dest: string) {
     try {
         fs.ensureSymlinkSync(src, dest);
     } catch (error) {
-        //FIXME: Jank safety net
-        fs.ensureDirSync(path.dirname(dest));
-        let cmd = Deno.run({
-            cmd: ["cmd", "/C", "mklink", dest, src],
-            stderr: "null",
-            stdin: "null",
-            stdout: "null",
-        });
-        if (!(await cmd.status()).success) {
-            logger.debug(`Failed to link\n${src}\n=> ${dest}`);
-            logger.debug(error);
-            return false;
-        }
+        logger.debug(`Failed to link\n${src}\n=> ${dest}`);
+        logger.debug(error);
+        return false;
     }
     return true;
 }
@@ -193,7 +173,7 @@ async function main() {
             nc(title)
         } [${nc(author)}]`
             .trim()
-            .replace(/[<>:"/\\|?*]/g, "-");
+            .replace(/[<>:"/\\|?*]/g, "_");
     }
 
     // Get filenames and hashes, generate final paths, and perform op
@@ -211,14 +191,16 @@ async function main() {
             lazerFiles,
             hashToFile(hash as string),
         );
+        let folderName = folderNames[ID as number]
         const dest: string = path.join(
             stableFiles,
-            folderNames[ID as number],
+            // Try to keep it under the path length limit using a generous estimate
+            folderName.length < 80 ? folderName : folderName.split(" ")[0],
             (filename as string),
         );
 
         //logger.debug(`${mode}ing\n${src}\n =>${dest}`);
-        const success = await op(src, dest);
+        const success = op(src, dest);
         if (!success) {
             progress.errors += 1;
         }
